@@ -218,6 +218,5 @@
         indexable.OldParentId = movedItemRemoteEvent.OldParentId;
       }
     }
-
   }
 }
