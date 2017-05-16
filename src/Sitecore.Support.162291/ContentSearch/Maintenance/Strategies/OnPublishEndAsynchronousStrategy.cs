@@ -14,168 +14,200 @@
 
   public class OnPublishEndAsynchronousStrategy : Sitecore.ContentSearch.Maintenance.Strategies.OnPublishEndAsynchronousStrategy
   {
- 
     public OnPublishEndAsynchronousStrategy(string database) : base(database)
     {
     }
 
-    protected override void Run(System.Collections.Generic.List<QueuedEvent> queue, ISearchIndex index)
+    /// <summary>
+    /// Runs the specified queue.
+    /// </summary>
+    /// <param name="queue">The queue.</param>
+    /// <param name="index">The index.</param>
+    protected override void Run(List<QueuedEvent> queue, ISearchIndex index)
     {
-      CrawlingLog.Log.Debug(string.Format("[Index={0}] {1} executing.", index.Name, base.GetType().Name), null);
+      CrawlingLog.Log.Debug(string.Format("[Index={0}] {1} executing.", index.Name, this.GetType().Name));
+
       if (this.Database == null)
       {
-        CrawlingLog.Log.Fatal(string.Format("[Index={0}] OperationMonitor has invalid parameters. Index Update cancelled.", index.Name), null);
+        CrawlingLog.Log.Fatal(string.Format("[Index={0}] OperationMonitor has invalid parameters. Index Update cancelled.", index.Name));
         return;
       }
-      queue = (from q in queue
-               where q.Timestamp > (index.Summary.LastUpdatedTimestamp ?? 0L)
-               select q).ToList<QueuedEvent>();
+
+      var lastUpdated = index.Summary.LastUpdatedTimestamp ?? 0;
+      queue = queue.Where(q => q.Timestamp > lastUpdated).ToList();
+
       if (queue.Count <= 0)
       {
-        CrawlingLog.Log.Debug(string.Format("[Index={0}] Event Queue is empty. Incremental update returns", index.Name), null);
+        CrawlingLog.Log.Debug(string.Format("[Index={0}] Event Queue is empty. Incremental update returns", index.Name));
         return;
       }
-      if (!this.CheckForThreshold || queue.Count <= this.ContentSearchSettings.FullRebuildItemCountThreshold())
+
+      if (this.CheckForThreshold && queue.Count > this.ContentSearchSettings.FullRebuildItemCountThreshold())
       {
-        System.Collections.Generic.List<IndexableInfo> list = this.ExtractIndexableInfoFromQueue(queue).ToList<IndexableInfo>();
-        CrawlingLog.Log.Info(string.Format("[Index={0}] Updating '{1}' items from Event Queue.", index.Name, list.Count<IndexableInfo>()), null);
-        Job job = IndexCustodian.IncrementalUpdate(index, list);
-        job.Wait();
+        CrawlingLog.Log.Warn(string.Format("[Index={0}] The number of changes exceeded maximum threshold of '{1}'.", index.Name, this.ContentSearchSettings.FullRebuildItemCountThreshold()));
+        if (this.RaiseRemoteEvents)
+        {
+          Job fullRebuildJob = IndexCustodian.FullRebuild(index);
+          fullRebuildJob.Wait();
+        }
+        else
+        {
+          Job fullRebuildRemoteJob = IndexCustodian.FullRebuildRemote(index);
+          fullRebuildRemoteJob.Wait();
+        }
+
         return;
       }
-      CrawlingLog.Log.Warn(string.Format("[Index={0}] The number of changes exceeded maximum threshold of '{1}'.", index.Name, this.ContentSearchSettings.FullRebuildItemCountThreshold()), null);
-      if (this.RaiseRemoteEvents)
-      {
-        Job job2 = IndexCustodian.FullRebuild(index, true);
-        job2.Wait();
-        return;
-      }
-      Job job3 = IndexCustodian.FullRebuildRemote(index, true);
-      job3.Wait();
+
+      List<IndexableInfo> parsed = this.ExtractIndexableInfoFromQueue(queue).ToList();
+      CrawlingLog.Log.Info(string.Format("[Index={0}] Updating '{1}' items from Event Queue.", index.Name, parsed.Count()));
+
+      Job incrememtalUpdateJob = IndexCustodian.IncrementalUpdate(index, parsed);
+      incrememtalUpdateJob.Wait();
     }
 
-    protected new System.Collections.Generic.IEnumerable<IndexableInfo> ExtractIndexableInfoFromQueue(System.Collections.Generic.List<QueuedEvent> queue)
+    /// <summary>
+    /// Extracts instances of <see cref="IndexableInfo"/> from queue.
+    /// </summary>
+    /// <param name="queue">The event queue.</param>
+    /// <returns><see cref="IEnumerable{T}"/></returns>
+    protected new IEnumerable<IndexableInfo> ExtractIndexableInfoFromQueue(List<QueuedEvent> queue)
     {
-      System.Collections.Generic.Dictionary<DataUri, IndexableInfo> dictionary = new System.Collections.Generic.Dictionary<DataUri, IndexableInfo>();
-      System.Collections.Generic.Dictionary<DataUri, IndexableInfo> dictionary2 = new System.Collections.Generic.Dictionary<DataUri, IndexableInfo>();
-      System.Collections.Generic.Dictionary<DataUri, IndexableInfo> dictionary3 = new System.Collections.Generic.Dictionary<DataUri, IndexableInfo>();
-      foreach (QueuedEvent current in queue)
+      var indexableListToUpdate = new DataUriBucketDictionary<IndexableInfo>();
+      var indexableListToRemove = new DataUriBucketDictionary<IndexableInfo>();
+      var indexableListToAddVersion = new DataUriBucketDictionary<IndexableInfo>();
+
+      foreach (var queuedEvent in queue)
       {
-        ItemRemoteEventBase itemRemoteEventBase = this.Database.RemoteEvents.Queue.DeserializeEvent(current) as ItemRemoteEventBase;
-        if (itemRemoteEventBase != null)
+        var instanceData = this.Database.RemoteEvents.Queue.DeserializeEvent(queuedEvent) as ItemRemoteEventBase;
+
+        if (instanceData == null)
         {
-          DataUri dataUri = new DataUri(ID.Parse(itemRemoteEventBase.ItemId), Language.Parse(itemRemoteEventBase.LanguageName), Sitecore.Data.Version.Parse(itemRemoteEventBase.VersionNumber));
-          ItemUri itemUri = new ItemUri(dataUri.ItemID, dataUri.Language, dataUri.Version, this.Database);
-          IndexableInfo indexable = new IndexableInfo(new SitecoreItemUniqueId(itemUri), current.Timestamp);
-          if (itemRemoteEventBase is RemovedVersionRemoteEvent || itemRemoteEventBase is DeletedItemRemoteEvent)
-          {
-            this.HandleIndexableToRemove(dictionary2, dataUri, indexable);
-          }
-          else if (itemRemoteEventBase is AddedVersionRemoteEvent)
-          {
-            this.HandleIndexableToAddVersion(dictionary3, dataUri, indexable);
-          }
-          else
-          {
-            this.UpdateIndexableInfo(itemRemoteEventBase, indexable);
-            this.HandleIndexableToUpdate(dictionary, dataUri, indexable);
-          }
+          continue;
+        }
+
+        var key = new DataUri(ID.Parse(instanceData.ItemId), Language.Parse(instanceData.LanguageName), Data.Version.Parse(instanceData.VersionNumber));
+        var itemUri = new ItemUri(key.ItemID, key.Language, key.Version, this.Database);
+        var indexable = new IndexableInfo(new SitecoreItemUniqueId(itemUri), queuedEvent.Timestamp);
+
+        if (instanceData is RemovedVersionRemoteEvent || instanceData is DeletedItemRemoteEvent)
+        {
+          this.HandleIndexableToRemove(indexableListToRemove, key, indexable);
+        }
+        else if (instanceData is AddedVersionRemoteEvent)
+        {
+          this.HandleIndexableToAddVersion(indexableListToAddVersion, key, indexable);
+        }
+        else
+        {
+          this.UpdateIndexableInfo(instanceData, indexable);
+          this.HandleIndexableToUpdate(indexableListToUpdate, key, indexable);
         }
       }
-      return (from x in (from x in dictionary
-                         select x.Value).Union(from x in dictionary2
-                                               select x.Value).Union(from x in dictionary3
-                                                                     select x.Value)
-              orderby x.Timestamp
-              select x).ToList<IndexableInfo>();
+
+      return indexableListToUpdate.ExtractValues()
+        .Concat(indexableListToRemove.ExtractValues())
+        .Concat(indexableListToAddVersion.ExtractValues())
+        .OrderBy(x => x.Timestamp).ToList();
     }
 
-    private void HandleIndexableToUpdate(System.Collections.Generic.Dictionary<DataUri, IndexableInfo> collection, DataUri key, IndexableInfo indexable)
+
+    /// <summary>
+    /// Processes indexable that contains data about item or version removed events.
+    /// </summary>
+    /// <param name="collection">The indexable collection.</param>
+    /// <param name="key">The indexable key.</param>
+    /// <param name="indexable">The indexable data.</param>
+    private void HandleIndexableToUpdate(DataUriBucketDictionary<IndexableInfo> collection, DataUri key, IndexableInfo indexable)
     {
-      bool flag = collection.Any((KeyValuePair<DataUri, IndexableInfo> x) => x.Key.ItemID == key.ItemID && x.Value.NeedUpdateChildren);
-      bool flag2 = collection.Any((KeyValuePair<DataUri, IndexableInfo> x) => x.Key.ItemID == key.ItemID && x.Value.IsSharedFieldChanged);
-      bool flag3 = collection.Any((KeyValuePair<DataUri, IndexableInfo> x) => x.Key.ItemID == key.ItemID && x.Key.Language == key.Language && x.Value.IsUnversionedFieldChanged);
+      bool alreadySetNeedUpdateChildren = collection.ContainsAny(key.ItemID, x => x.Value.NeedUpdateChildren);
+      bool alreadyAddedSharedFieldChange = collection.ContainsAny(key.ItemID, x => x.Value.IsSharedFieldChanged);
+      bool alreadyAddedUnversionedFieldChange = collection.ContainsAny(key.ItemID, x => x.Key.Language == key.Language && x.Value.IsUnversionedFieldChanged);
+
       // Sitecore.Support start
-      if (flag)
+      if (alreadySetNeedUpdateChildren)
       {
-        IndexableInfo value = collection.FirstOrDefault((KeyValuePair<DataUri, IndexableInfo> x) => x.Key.ItemID == key.ItemID && x.Key.Language == key.Language && x.Key.Version.Number == key.Version.Number).Value;
+        IndexableInfo value = null;
+        try
+        {
+          value = collection.First(key.ItemID, (KeyValuePair<DataUri, IndexableInfo> x) => x.Key.ItemID == key.ItemID && x.Key.Language == key.Language && x.Key.Version.Number == key.Version.Number);
+        }
+        catch
+        {
+          value = null;
+        }
 
         if (value != null)
         {
           value.Timestamp = indexable.Timestamp;
-          value.NeedUpdateChildren = (value.NeedUpdateChildren || indexable.NeedUpdateChildren);
+          value.NeedUpdateChildren = value.NeedUpdateChildren || indexable.NeedUpdateChildren;
         }
         else
         {
-          (from x in collection.Keys
-           where x.ItemID == key.ItemID 
-           && x.Language == key.Language 
-           select x).ToList<DataUri>().ForEach(delegate (DataUri x)
-           {
-             collection.Remove(x);
-           });
-
-          indexable.NeedUpdateChildren = (flag || indexable.NeedUpdateChildren);
-          collection.Add(key, indexable);          
+          collection.RemoveAll(key.ItemID, (x) => x.ItemID == key.ItemID && x.Language == key.Language);
+          indexable.NeedUpdateChildren = (alreadySetNeedUpdateChildren || indexable.NeedUpdateChildren);
+          collection.Add(key, indexable);
         }
-
-        return;
       }
-
-      if (flag2)
+      else if (alreadyAddedSharedFieldChange)
       // Sitecore.Support end
       {
-        IndexableInfo value = collection.First((System.Collections.Generic.KeyValuePair<DataUri, IndexableInfo> x) => x.Key.ItemID == key.ItemID).Value;
-        value.Timestamp = indexable.Timestamp;
-        value.NeedUpdateChildren = (value.NeedUpdateChildren || indexable.NeedUpdateChildren);
-        return;
+        var entry = collection.First(key.ItemID);
+        entry.Timestamp = indexable.Timestamp;
+        entry.NeedUpdateChildren = entry.NeedUpdateChildren || indexable.NeedUpdateChildren;
       }
-      if (indexable.IsSharedFieldChanged || indexable.NeedUpdateChildren)
+      else if (indexable.IsSharedFieldChanged || indexable.NeedUpdateChildren)
       {
-        (from x in collection.Keys
-         where x.ItemID == key.ItemID
-         select x).ToList<DataUri>().ForEach(delegate (DataUri x)
-         {
-           collection.Remove(x);
-         });
+        collection.RemoveAll(key.ItemID);
         collection.Add(key, indexable);
-        return;
       }
-      if (flag3)
+      else if (alreadyAddedUnversionedFieldChange)
       {
-        collection.First((System.Collections.Generic.KeyValuePair<DataUri, IndexableInfo> x) => x.Key.ItemID == key.ItemID && x.Key.Language == key.Language).Value.Timestamp = indexable.Timestamp;
-        return;
+        collection.First(key.ItemID, x => x.Key.Language == key.Language).Timestamp = indexable.Timestamp;
       }
-      if (indexable.IsUnversionedFieldChanged)
+      else if (indexable.IsUnversionedFieldChanged)
       {
-        (from x in collection.Keys
-         where x.ItemID == key.ItemID && x.Language == key.Language
-         select x).ToList<DataUri>().ForEach(delegate (DataUri x)
-         {
-           collection.Remove(x);
-         });
+        collection.RemoveAll(key.ItemID);
         collection.Add(key, indexable);
-        return;
       }
-      if (collection.ContainsKey(key))
+      else
       {
-        collection[key].Timestamp = indexable.Timestamp;
-        return;
+        if (collection.ContainsKey(key))
+        {
+          collection[key].Timestamp = indexable.Timestamp;
+        }
+        else
+        {
+          collection.Add(key, indexable);
+        }
       }
-      collection.Add(key, indexable);
     }
 
-    private void HandleIndexableToRemove(System.Collections.Generic.Dictionary<DataUri, IndexableInfo> collection, DataUri key, IndexableInfo indexable)
+    /// <summary>
+    /// Processes indexable that contains data about item or version removed events.
+    /// </summary>
+    /// <param name="collection">The indexable collection.</param>
+    /// <param name="key">The indexable key.</param>
+    /// <param name="indexable">The indexable data.</param>
+    private void HandleIndexableToRemove(DataUriBucketDictionary<IndexableInfo> collection, DataUri key, IndexableInfo indexable)
     {
       if (collection.ContainsKey(key))
       {
         collection[key].Timestamp = indexable.Timestamp;
-        return;
       }
-      collection.Add(key, indexable);
+      else
+      {
+        collection.Add(key, indexable);
+      }
     }
 
-    private void HandleIndexableToAddVersion(System.Collections.Generic.Dictionary<DataUri, IndexableInfo> collection, DataUri key, IndexableInfo indexable)
+    /// <summary>
+    /// Handles the indexable to add version.
+    /// </summary>
+    /// <param name="collection">The collection.</param>
+    /// <param name="key">The key.</param>
+    /// <param name="indexable">The indexable.</param>
+    private void HandleIndexableToAddVersion(DataUriBucketDictionary<IndexableInfo> collection, DataUri key, IndexableInfo indexable)
     {
       indexable.IsVersionAdded = true;
       if (!collection.ContainsKey(key))
@@ -184,38 +216,48 @@
       }
     }
 
+    /// <summary>
+    /// Updates the indexable info.
+    /// </summary>
+    /// <param name="instanceData">The instance data.</param>
+    /// <param name="indexable">The indexable.</param>
     private void UpdateIndexableInfo(ItemRemoteEventBase instanceData, IndexableInfo indexable)
     {
       if (instanceData is SavedItemRemoteEvent)
       {
-        SavedItemRemoteEvent savedItemRemoteEvent = instanceData as SavedItemRemoteEvent;
-        if (savedItemRemoteEvent.IsSharedFieldChanged)
+        var savedEvent = instanceData as SavedItemRemoteEvent;
+
+        if (savedEvent.IsSharedFieldChanged)
         {
           indexable.IsSharedFieldChanged = true;
         }
-        if (savedItemRemoteEvent.IsUnversionedFieldChanged)
+
+        if (savedEvent.IsUnversionedFieldChanged)
         {
           indexable.IsUnversionedFieldChanged = true;
         }
       }
+
       if (instanceData is RestoreItemCompletedEvent)
       {
         indexable.IsSharedFieldChanged = true;
       }
+
       if (instanceData is CopiedItemRemoteEvent)
       {
         indexable.IsSharedFieldChanged = true;
-        CopiedItemRemoteEvent copiedItemRemoteEvent = instanceData as CopiedItemRemoteEvent;
-        if (copiedItemRemoteEvent.Deep)
+        var copiedItemData = instanceData as CopiedItemRemoteEvent;
+        if (copiedItemData.Deep)
         {
           indexable.NeedUpdateChildren = true;
         }
       }
-      MovedItemRemoteEvent movedItemRemoteEvent = instanceData as MovedItemRemoteEvent;
-      if (movedItemRemoteEvent != null)
+
+      var @event = instanceData as MovedItemRemoteEvent;
+      if (@event != null)
       {
         indexable.NeedUpdateChildren = true;
-        indexable.OldParentId = movedItemRemoteEvent.OldParentId;
+        indexable.OldParentId = @event.OldParentId;
       }
     }
   }
