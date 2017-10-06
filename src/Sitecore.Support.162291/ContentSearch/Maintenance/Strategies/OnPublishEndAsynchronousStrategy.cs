@@ -7,8 +7,10 @@
   using Sitecore.ContentSearch.Maintenance;
   using Sitecore.Data;
   using Sitecore.Data.Eventing.Remote;
+  using Sitecore.Data.Items;
   using Sitecore.Eventing;
   using Sitecore.Globalization;
+  using Sitecore.SecurityModel;
   using System.Collections.Generic;
   using System.Linq;
 
@@ -100,8 +102,19 @@
         }
         else
         {
-          this.UpdateIndexableInfo(instanceData, indexable);
-          this.HandleIndexableToUpdate(indexableListToUpdate, key, indexable);
+          #region Sitecore.Support.31802
+          // Fix Publishing Service issue 31802 (Publihing Service does not raise 'RemovedVersionRemoteEvent' after removing version from target database);
+          // It raises 'SavedItemRemoteEvent' event instead
+          if (ShouldVersionBeRemoved(instanceData, indexable))
+          {
+            this.HandleIndexableToRemove(indexableListToRemove, key, indexable);
+          }
+          else
+          {
+            this.UpdateIndexableInfo(instanceData, indexable);
+            this.HandleIndexableToUpdate(indexableListToUpdate, key, indexable);
+          }
+          #endregion
         }
       }
 
@@ -111,6 +124,58 @@
         .OrderBy(x => x.Timestamp).ToList();
     }
 
+
+    #region Sitecore.Support.31802
+    private bool ShouldVersionBeRemoved(ItemRemoteEventBase instanceData, IndexableInfo indexable)
+    {
+      var should = true;
+      var shouldNot = !should;
+
+
+      // Publishing Service raises 'SavedItemRemoteEvent' without any field changes instead of 'RemovedVersionRemoteEvent'.
+      // Therefore in case the remote event contains changed fields the event is not related to the removing version from target database.
+      var wereFieldsChanged = false;
+
+      if (instanceData is SavedItemRemoteEvent)
+      {
+        var savedEvent = instanceData as SavedItemRemoteEvent;
+
+        wereFieldsChanged = savedEvent.IsSharedFieldChanged || savedEvent.IsUnversionedFieldChanged || savedEvent.FieldChanges.Count > 0;
+
+        if (wereFieldsChanged)
+        { return shouldNot; }
+      }
+      else
+      {
+        return shouldNot;
+      }
+
+
+      var itemUri = indexable.IndexableUniqueId.Value as ItemUri;
+
+      using (new SecurityDisabler())
+      {
+        Item latestItem;
+
+        var latestItemUri = new ItemUri(itemUri.ItemID, itemUri.Language, Data.Version.Latest, itemUri.DatabaseName);
+
+        using (new WriteCachesDisabler())
+        {
+          latestItem = Data.Database.GetItem(latestItemUri);
+        }
+
+        if (latestItem == null || latestItem.Versions.Count < 1 || latestItem.Version.Number > itemUri.Version.Number) // (item.Version.Number < itemUri.Version.Number || latestItem.IsFallback) && latestItem.Versions.Count > 0) // Sitecore.Support.141095
+        {
+          return should;
+        }
+        else
+        {
+          // Consider current 'indexable' as candidate to remove from the index
+          return shouldNot;
+        }
+      }
+    }
+    #endregion
 
     /// <summary>
     /// Processes indexable that contains data about item or version removed events.
